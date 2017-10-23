@@ -127,13 +127,14 @@ class Connection(object):
     """
 
     def __init__(self, host, port, ssl_key=None, ssl_cert=None, ssl_ca=None,
-                 client_id='unknown'):
+                 client_id='unknown', keepalive_interval=600):
         self.log = logging.getLogger("gear.Connection.%s" % (client_id,))
         self.host = host
         self.port = port
         self.ssl_key = ssl_key
         self.ssl_cert = ssl_cert
         self.ssl_ca = ssl_ca
+        self.keepalive_interval = keepalive_interval
 
         self.use_ssl = False
         if all([self.ssl_key, self.ssl_cert, self.ssl_ca]):
@@ -153,8 +154,18 @@ class Connection(object):
         self.pending_tasks = []
         self.admin_requests = []
         self.echo_conditions = {}
+        self.echo_thread = None
         self.options = set()
         self.changeState("INIT")
+
+    def _check_server_connection(self):
+        try:
+            while self.connected:
+                self.echo()
+                time.sleep(self.keepalive_interval)
+        except TimeoutError:
+            self.log.debug("Timed out while waiting for ECHO_RES from the server. Disconnecting.")
+            self.disconnect()
 
     def changeState(self, state):
         # The state variables are provided as a convenience (and used by
@@ -208,6 +219,10 @@ class Connection(object):
         self.log.info("Connected to %s port %s" % (self.host, self.port))
         self.conn = s
         self.connected = True
+        self.echo_thread = threading.Thread(
+            name="Echo worker %s:%s" % (self.host, self.port),
+            target=self._check_server_connection)
+        self.echo_thread.start()
         self.connect_time = time.time()
         self.input_buffer = b''
         self.need_bytes = False
@@ -216,7 +231,6 @@ class Connection(object):
         """Disconnect from the server and remove all associated state
         data.
         """
-
         if self.conn:
             try:
                 self.conn.close()
@@ -225,6 +239,9 @@ class Connection(object):
 
         self.log.info("Disconnected from %s port %s" % (self.host, self.port))
         self._init()
+        if self.echo_thread:
+            self.echo_thread.join()
+            self.echo_thread = None
 
     def reconnect(self):
         """Disconnect from and reconnect to the server, removing all
@@ -381,15 +398,20 @@ class Connection(object):
         finally:
             self.echo_lock.release()
 
+
         self.sendEchoReq(data)
 
         condition.acquire()
         condition.wait(timeout)
         condition.release()
 
-        if data in self.echo_conditions:
-            return data
-        raise TimeoutError()
+        self.echo_lock.acquire()
+        try:
+            if data in self.echo_conditions:
+                del self.echo_conditions[data]
+                raise TimeoutError()
+        finally:
+            self.echo_lock.release()
 
     def sendEchoReq(self, data):
         p = Packet(constants.REQ, constants.ECHO_REQ, data)
@@ -407,7 +429,12 @@ class Connection(object):
 
         if not condition:
             return False
-        condition.notifyAll()
+        self.log.debug("notifying %s" % (condition,))
+        condition.acquire()
+        try:
+            condition.notifyAll()
+        finally:
+            condition.release()
         return True
 
     def handleOptionRes(self, option):
@@ -3070,6 +3097,10 @@ class Server(BaseClientServer):
             self.handleACLSelfRevoke(request)
 
         self.log.debug("Finished handling admin request %s" % (request,))
+
+    def handleEchoReq(self, packet):
+        p = Packet(constants.REQ, constants.ECHO_REQ, packet.data)
+        self.sendPacket(p)
 
     def _cancelJob(self, request, job, queue):
         if self.acl:
